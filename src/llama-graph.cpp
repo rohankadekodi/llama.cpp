@@ -103,12 +103,13 @@ void llm_graph_input_pos_bucket_kv::set_input(const llama_ubatch * ubatch) {
 
         int32_t * data = (int32_t *) pos_bucket->data;
 
-        const int64_t n_kv = kv_self->n;
+        // TODO: assert no SWA
+        const int64_t n_kv = kv_self->cells_base.n;
 
         for (int h = 0; h < 1; ++h) {
             for (int j = 0; j < n_tokens; ++j) {
                 for (int i = 0; i < n_kv; ++i) {
-                    data[h*(n_kv*n_tokens) + j*n_kv + i] = llama_relative_position_bucket(kv_self->cells[i].pos, ubatch->pos[j], hparams.n_rel_attn_bkts, false);
+                    data[h*(n_kv*n_tokens) + j*n_kv + i] = llama_relative_position_bucket(kv_self->cells_base.data[i].pos, ubatch->pos[j], hparams.n_rel_attn_bkts, false);
                 }
             }
         }
@@ -390,94 +391,129 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 
 void llm_graph_input_attn_kv_unified::set_input(const llama_ubatch * ubatch) {
     if (self_kq_mask || self_kq_mask_swa) {
-        const int64_t n_kv         = kv_self->n;
         const int64_t n_tokens     = ubatch->n_tokens;
         const int64_t n_seq_tokens = ubatch->n_seq_tokens;
         const int64_t n_seqs       = ubatch->n_seqs;
 
-        float * data     = nullptr;
-        float * data_swa = nullptr;
+        {
+            float * data     = nullptr;
 
-        if (self_kq_mask) {
-            GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
-            data = (float *) self_kq_mask->data;
-        }
+            if (self_kq_mask) {
+                GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
+                data = (float *) self_kq_mask->data;
+            }
 
-        if (self_kq_mask_swa) {
-            GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask_swa->buffer));
-            data_swa = (float *) self_kq_mask_swa->data;
-        }
+            const int64_t n_kv = kv_self->cells_base.n;
 
-        // Use only the previous KV cells of the correct sequence for each token of the ubatch.
-        // It's assumed that if a token in the batch has multiple sequences, they are equivalent.
-        // Example with a cache of 10 tokens, 2 tokens populated in cache and 3 tokens in batch:
-        //   Causal mask:
-        //      xxx-------
-        //      xxxx------
-        //      xxxxx-----
-        //   Non-causal mask:
-        //      xxxxx-----
-        //      xxxxx-----
-        //      xxxxx-----
-        // To visualize the mask, see https://github.com/ggml-org/llama.cpp/pull/12615
-        for (int h = 0; h < 1; ++h) {
-            for (int s = 0; s < n_seqs; ++s) {
-                const llama_seq_id seq_id = ubatch->seq_id[s][0];
+            // Use only the previous KV cells of the correct sequence for each token of the ubatch.
+            // It's assumed that if a token in the batch has multiple sequences, they are equivalent.
+            // Example with a cache of 10 tokens, 2 tokens populated in cache and 3 tokens in batch:
+            //   Causal mask:
+            //      xxx-------
+            //      xxxx------
+            //      xxxxx-----
+            //   Non-causal mask:
+            //      xxxxx-----
+            //      xxxxx-----
+            //      xxxxx-----
+            // To visualize the mask, see https://github.com/ggml-org/llama.cpp/pull/12615
+            for (int h = 0; h < 1; ++h) {
+                for (int s = 0; s < n_seqs; ++s) {
+                    const llama_seq_id seq_id = ubatch->seq_id[s][0];
 
-                for (int j = 0; j < n_seq_tokens; ++j) {
-                    const llama_pos pos = ubatch->pos[s*n_seq_tokens + j];
-                    for (int i = 0; i < n_kv; ++i) {
-                        float f;
-                        // mask the token if:
-                        if (!kv_self->cells[i].has_seq_id(seq_id) // not the correct sequence
-                            || (cparams.causal_attn && kv_self->cells[i].pos > pos) // for causal, mask future tokens
-                        ) {
-                            f = -INFINITY;
-                        } else {
-                            if (hparams.use_alibi) {
-                                f = -std::abs(kv_self->cells[i].pos - pos);
+                    for (int j = 0; j < n_seq_tokens; ++j) {
+                        const llama_pos pos = ubatch->pos[s*n_seq_tokens + j];
+
+                        for (int i = 0; i < n_kv; ++i) {
+                            float f;
+                            // mask the token if:
+                            if (!kv_self->cells_base.data[i].has_seq_id(seq_id) // not the correct sequence
+                                    || (cparams.causal_attn && kv_self->cells_base.data[i].pos > pos) // for causal, mask future tokens
+                               ) {
+                                f = -INFINITY;
                             } else {
-                                f = 0.0f;
-                            }
-                        }
-
-                        if (data) {
-                            data[h*(n_kv*n_tokens) + s*(n_kv*n_seq_tokens) + j*n_kv + i] = f;
-                        }
-
-                        // may need to cut off old tokens for sliding window
-                        // TODO @ngxson : we are currently re-using the swa logic to store the chunked mask, we should rename SWA to something more generic like "aux mask"
-                        if (data_swa) {
-                            if (hparams.n_attn_chunk) {
-                                llama_pos pos_chunk_start = (pos / hparams.n_attn_chunk) * hparams.n_attn_chunk;
-                                if (kv_self->cells[i].pos < pos_chunk_start || pos < pos_chunk_start) {
-                                    f = -INFINITY;
-                                }
-                            } else {
-                                if (pos - kv_self->cells[i].pos >= (int32_t)hparams.n_swa) {
-                                    f = -INFINITY;
+                                if (hparams.use_alibi) {
+                                    f = -std::abs(kv_self->cells_base.data[i].pos - pos);
+                                } else {
+                                    f = 0.0f;
                                 }
                             }
-                            data_swa[h*(n_kv*n_tokens) + s*(n_kv*n_seq_tokens) + j*n_kv + i] = f;
+
+                            if (data) {
+                                data[h*(n_kv*n_tokens) + s*(n_kv*n_seq_tokens) + j*n_kv + i] = f;
+                            }
+                        }
+                    }
+                }
+
+                // mask padded tokens
+                if (data) {
+                    for (int i = n_tokens; i < GGML_PAD(n_tokens, GGML_KQ_MASK_PAD); ++i) {
+                        for (int j = 0; j < n_kv; ++j) {
+                            data[h*(n_kv*n_tokens) + i*n_kv + j] = -INFINITY;
                         }
                     }
                 }
             }
+        }
 
-            // mask padded tokens
-            if (data) {
-                for (int i = n_tokens; i < GGML_PAD(n_tokens, GGML_KQ_MASK_PAD); ++i) {
-                    for (int j = 0; j < n_kv; ++j) {
-                        data[h*(n_kv*n_tokens) + i*n_kv + j] = -INFINITY;
-                    }
-                }
+        {
+            float * data_swa = nullptr;
+
+            if (self_kq_mask_swa) {
+                GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask_swa->buffer));
+                data_swa = (float *) self_kq_mask_swa->data;
             }
 
-            // mask padded tokens
-            if (data_swa) {
-                for (int i = n_tokens; i < GGML_PAD(n_tokens, GGML_KQ_MASK_PAD); ++i) {
-                    for (int j = 0; j < n_kv; ++j) {
-                        data_swa[h*(n_kv*n_tokens) + i*n_kv + j] = -INFINITY;
+            const int64_t n_kv = kv_self->cells_base.n;
+
+            for (int h = 0; h < 1; ++h) {
+                for (int s = 0; s < n_seqs; ++s) {
+                    const llama_seq_id seq_id = ubatch->seq_id[s][0];
+
+                    for (int j = 0; j < n_seq_tokens; ++j) {
+                        const llama_pos pos = ubatch->pos[s*n_seq_tokens + j];
+
+                        for (int i = 0; i < n_kv; ++i) {
+                            float f;
+                            // mask the token if:
+                            if (!kv_self->cells_base.data[i].has_seq_id(seq_id) // not the correct sequence
+                                    || (cparams.causal_attn && kv_self->cells_base.data[i].pos > pos) // for causal, mask future tokens
+                               ) {
+                                f = -INFINITY;
+                            } else {
+                                if (hparams.use_alibi) {
+                                    f = -std::abs(kv_self->cells_base.data[i].pos - pos);
+                                } else {
+                                    f = 0.0f;
+                                }
+                            }
+
+                            // may need to cut off old tokens for sliding window
+                            // TODO @ngxson : we are currently re-using the swa logic to store the chunked mask, we should rename SWA to something more generic like "aux mask"
+                            if (data_swa) {
+                                if (hparams.n_attn_chunk) {
+                                    llama_pos pos_chunk_start = (pos / hparams.n_attn_chunk) * hparams.n_attn_chunk;
+                                    if (kv_self->cells_base.data[i].pos < pos_chunk_start || pos < pos_chunk_start) {
+                                        f = -INFINITY;
+                                    }
+                                } else {
+                                    if (pos - kv_self->cells_base.data[i].pos >= (int32_t)hparams.n_swa) {
+                                        f = -INFINITY;
+                                    }
+                                }
+                                data_swa[h*(n_kv*n_tokens) + s*(n_kv*n_seq_tokens) + j*n_kv + i] = f;
+                            }
+                        }
+                    }
+                }
+
+                // mask padded tokens
+                if (data_swa) {
+                    for (int i = n_tokens; i < GGML_PAD(n_tokens, GGML_KQ_MASK_PAD); ++i) {
+                        for (int j = 0; j < n_kv; ++j) {
+                            data_swa[h*(n_kv*n_tokens) + i*n_kv + j] = -INFINITY;
+                        }
                     }
                 }
             }
@@ -1130,7 +1166,8 @@ ggml_tensor * llm_graph_context::build_inp_pos_bucket_dec() const {
 
     auto inp = std::make_unique<llm_graph_input_pos_bucket_kv>(hparams, kv_self);
 
-    const auto n_kv = kv_self->n;
+    // TODO: assert no SWA
+    const auto n_kv = kv_self->cells_base.n;
 
     auto & cur = inp->pos_bucket;
 
@@ -1335,16 +1372,20 @@ llm_graph_input_attn_kv_unified * llm_graph_context::build_attn_inp_kv_unified()
 
     auto inp = std::make_unique<llm_graph_input_attn_kv_unified>(hparams, cparams, kv_self);
 
-    const auto n_kv = kv_self->n;
+    {
+        const auto n_kv = kv_self->cells_base.n;
 
-    inp->self_kq_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
-    //cb(inp->self_kq_mask, "KQ_mask", -1);
-    ggml_set_input(inp->self_kq_mask);
+        inp->self_kq_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
+        //cb(inp->self_kq_mask, "KQ_mask", -1);
+        ggml_set_input(inp->self_kq_mask);
 
-    inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
+        inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
+    }
 
     if (hparams.n_swa_pattern > 1) {
         GGML_ASSERT(hparams.n_swa > 0);
+
+        const auto n_kv = kv_self->cells_base.n; // TODO: SWA
 
         inp->self_kq_mask_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
         //cb(inp->self_kq_mask_swa, "KQ_mask_swa", -1);
@@ -1375,6 +1416,9 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_build_forward_expand(gf, v_cur);
 
     const llama_kv_cache_unified * kv_self = static_cast<const llama_kv_cache_unified *>(memory);
+
+    const auto & kv_layer = kv_self->layers[il];
+
     const auto & n_ctx = cparams.n_ctx;
 
     const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
@@ -1386,11 +1430,11 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // store to KV cache
     {
-        const auto kv_head = kv_self->head;
+        const auto kv_head = kv_layer.cells->head;
 
-        GGML_ASSERT(kv_self->size == n_ctx);
+        GGML_ASSERT(kv_layer.cells->size == n_ctx);
 
-        ggml_tensor * k_cache_view = ggml_view_1d(ctx0, kv_self->k_l[il], n_tokens*n_embd_k_gqa, ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa)*kv_head);
+        ggml_tensor * k_cache_view = ggml_view_1d(ctx0, kv_layer.k, n_tokens*n_embd_k_gqa, ggml_row_size(kv_layer.k->type, n_embd_k_gqa)*kv_head);
         //cb(k_cache_view, "k_cache_view", il);
 
         // note: storing RoPE-ed version of K in the KV cache
@@ -1401,12 +1445,12 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * v_cache_view = nullptr;
 
         if (!v_trans) {
-            v_cache_view = ggml_view_1d(ctx0, kv_self->v_l[il], n_tokens*n_embd_v_gqa, ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa)*kv_head);
+            v_cache_view = ggml_view_1d(ctx0, kv_layer.v, n_tokens*n_embd_v_gqa, ggml_row_size(kv_layer.v->type, n_embd_v_gqa)*kv_head);
         } else {
             // note: the V cache is transposed when not using flash attention
-            v_cache_view = ggml_view_2d(ctx0, kv_self->v_l[il], n_tokens, n_embd_v_gqa,
-                    (  n_ctx)*ggml_element_size(kv_self->v_l[il]),
-                    (kv_head)*ggml_element_size(kv_self->v_l[il]));
+            v_cache_view = ggml_view_2d(ctx0, kv_layer.v, n_tokens, n_embd_v_gqa,
+                    (  n_ctx)*ggml_element_size(kv_layer.v),
+                    (kv_head)*ggml_element_size(kv_layer.v));
 
             v_cur = ggml_transpose(ctx0, v_cur);
         }
@@ -1419,7 +1463,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
-    const auto n_kv = kv_self->n;
+    const auto n_kv = kv_layer.cells->n;
 
     const int64_t n_head_kv = hparams.n_head_kv(il);
 
@@ -1430,23 +1474,23 @@ ggml_tensor * llm_graph_context::build_attn(
     //cb(q, "q", il);
 
     ggml_tensor * k =
-        ggml_view_3d(ctx0, kv_self->k_l[il],
+        ggml_view_3d(ctx0, kv_layer.k,
                 n_embd_head_k, n_kv, n_head_kv,
-                ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa),
-                ggml_row_size(kv_self->k_l[il]->type, n_embd_head_k),
+                ggml_row_size(kv_layer.k->type, n_embd_k_gqa),
+                ggml_row_size(kv_layer.k->type, n_embd_head_k),
                 0);
     //cb(k, "k", il);
 
     ggml_tensor * v = !v_trans ?
-        ggml_view_3d(ctx0, kv_self->v_l[il],
+        ggml_view_3d(ctx0, kv_layer.v,
                 n_embd_head_v, n_kv, n_head_kv,
-                ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa),
-                ggml_row_size(kv_self->v_l[il]->type, n_embd_head_v),
+                ggml_row_size(kv_layer.v->type, n_embd_v_gqa),
+                ggml_row_size(kv_layer.v->type, n_embd_head_v),
                 0) :
-        ggml_view_3d(ctx0, kv_self->v_l[il],
+        ggml_view_3d(ctx0, kv_layer.v,
                 n_kv, n_embd_head_v, n_head_kv,
-                ggml_element_size(kv_self->v_l[il])*n_ctx,
-                ggml_element_size(kv_self->v_l[il])*n_ctx*n_embd_head_v,
+                ggml_element_size(kv_layer.v)*n_ctx,
+                ggml_element_size(kv_layer.v)*n_ctx*n_embd_head_v,
                 0);
 
     ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_b, kq_mask, v_mla, v_trans, kq_scale);
