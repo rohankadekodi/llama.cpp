@@ -674,6 +674,10 @@ bool llama_kv_cache_unified::get_can_shift() const {
     return can_shift;
 }
 
+const llama_kv_cache_unified::kv_layer & llama_kv_cache_unified::get_layer(int32_t il) const {
+    return layers[il];
+}
+
 uint32_t llama_kv_cache_unified::n_base() const {
     return cells_arr[KV_CELLS_TYPE_BASE]->n;
 }
@@ -2744,7 +2748,7 @@ void llama_kv_cache_view_update(llama_kv_cache_view * view, const llama_kv_cache
         return;
     }
 
-    const auto & cells = kvu->cells_arr[llama_kv_cache_unified::KV_CELLS_TYPE_BASE];
+    const auto & cells = kvu->get_layer(0).cells;
 
     if (uint32_t(view->n_cells) < cells->size || view->cells == nullptr) {
         view->n_cells = int32_t(cells->size);

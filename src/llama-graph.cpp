@@ -1251,7 +1251,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const llama_kv_cache_unified * kv_self = static_cast<const llama_kv_cache_unified *>(memory);
 
-    const auto & kv_layer = kv_self->layers[il];
+    const auto & kv_layer = kv_self->get_layer(il);
 
     const auto & n_ctx = cparams.n_ctx;
 
@@ -1294,12 +1294,11 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     const bool is_swa = hparams.is_swa(il);
+    const int64_t n_head_kv = hparams.n_head_kv(il);
 
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
     const auto n_kv = kv_layer.cells->n;
-
-    const int64_t n_head_kv = hparams.n_head_kv(il);
 
     const auto & n_embd_head_k = hparams.n_embd_head_k;
     const auto & n_embd_head_v = hparams.n_embd_head_v;

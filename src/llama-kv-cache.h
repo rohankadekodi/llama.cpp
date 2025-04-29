@@ -245,6 +245,8 @@ public:
 
     bool get_can_shift() const override;
 
+    const kv_layer & get_layer(int32_t il) const;
+
     uint32_t n_base() const;
     uint32_t n_swa() const;
 
@@ -260,18 +262,17 @@ public:
 
     callbacks cbs;
 
+private:
     enum kv_cells_type {
         KV_CELLS_TYPE_BASE = 0,
         KV_CELLS_TYPE_SWA,
         KV_CELLS_TYPE_COUNT,
     };
 
-    //kv_cells cells_base;
     std::array<std::unique_ptr<kv_cells>, KV_CELLS_TYPE_COUNT> cells_arr;
 
     std::vector<kv_layer> layers;
 
-private:
     const llama_hparams & hparams;
 
     bool has_shift = false;
