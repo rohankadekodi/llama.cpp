@@ -9,33 +9,6 @@
 #include <cmath>
 #include <cstring>
 
-static int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional) {
-    // TODO move to hparams if a T5 variant appears that uses a different value
-    const int64_t max_distance = 128;
-
-    if (bidirectional) {
-        n_buckets >>= 1;
-    }
-
-    const int64_t max_exact = n_buckets >> 1;
-
-    int32_t relative_position = x - y;
-    int32_t relative_bucket = 0;
-
-    if (bidirectional) {
-        relative_bucket += (relative_position > 0) * n_buckets;
-        relative_position = abs(relative_position);
-    } else {
-        relative_position = -std::min<int32_t>(relative_position, 0);
-    }
-
-    int32_t relative_position_if_large = floorf(max_exact + logf(1.0 * relative_position / max_exact) * (n_buckets - max_exact) / log(1.0 * max_distance / max_exact));
-    relative_position_if_large = std::min<int32_t>(relative_position_if_large, n_buckets - 1);
-    relative_bucket += (relative_position < max_exact ? relative_position : relative_position_if_large);
-
-    return relative_bucket;
-}
-
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -96,23 +69,7 @@ void llm_graph_input_pos_bucket::set_input(const llama_ubatch * ubatch) {
 
 void llm_graph_input_pos_bucket_kv::set_input(const llama_ubatch * ubatch) {
     if (pos_bucket) {
-        const int64_t n_tokens = ubatch->n_tokens;
-
-        GGML_ASSERT(ggml_backend_buffer_is_host(pos_bucket->buffer));
-        GGML_ASSERT(!ubatch->equal_seqs); // TODO: use ubatch->n_seqs instead of failing
-
-        int32_t * data = (int32_t *) pos_bucket->data;
-
-        // TODO: assert no SWA
-        const int64_t n_kv = kv_self->cells_base.n;
-
-        for (int h = 0; h < 1; ++h) {
-            for (int j = 0; j < n_tokens; ++j) {
-                for (int i = 0; i < n_kv; ++i) {
-                    data[h*(n_kv*n_tokens) + j*n_kv + i] = llama_relative_position_bucket(kv_self->cells_base.data[i].pos, ubatch->pos[j], hparams.n_rel_attn_bkts, false);
-                }
-            }
-        }
+        kv_self->set_input_pos_bucket(pos_bucket, ubatch);
     }
 }
 
@@ -390,134 +347,12 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_attn_kv_unified::set_input(const llama_ubatch * ubatch) {
-    if (self_kq_mask || self_kq_mask_swa) {
-        const int64_t n_tokens     = ubatch->n_tokens;
-        const int64_t n_seq_tokens = ubatch->n_seq_tokens;
-        const int64_t n_seqs       = ubatch->n_seqs;
+    if (self_kq_mask) {
+        kv_self->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
-        {
-            float * data     = nullptr;
-
-            if (self_kq_mask) {
-                GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
-                data = (float *) self_kq_mask->data;
-            }
-
-            const int64_t n_kv = kv_self->cells_base.n;
-
-            // Use only the previous KV cells of the correct sequence for each token of the ubatch.
-            // It's assumed that if a token in the batch has multiple sequences, they are equivalent.
-            // Example with a cache of 10 tokens, 2 tokens populated in cache and 3 tokens in batch:
-            //   Causal mask:
-            //      xxx-------
-            //      xxxx------
-            //      xxxxx-----
-            //   Non-causal mask:
-            //      xxxxx-----
-            //      xxxxx-----
-            //      xxxxx-----
-            // To visualize the mask, see https://github.com/ggml-org/llama.cpp/pull/12615
-            for (int h = 0; h < 1; ++h) {
-                for (int s = 0; s < n_seqs; ++s) {
-                    const llama_seq_id seq_id = ubatch->seq_id[s][0];
-
-                    for (int j = 0; j < n_seq_tokens; ++j) {
-                        const llama_pos pos = ubatch->pos[s*n_seq_tokens + j];
-
-                        for (int i = 0; i < n_kv; ++i) {
-                            float f;
-                            // mask the token if:
-                            if (!kv_self->cells_base.data[i].has_seq_id(seq_id) // not the correct sequence
-                                    || (cparams.causal_attn && kv_self->cells_base.data[i].pos > pos) // for causal, mask future tokens
-                               ) {
-                                f = -INFINITY;
-                            } else {
-                                if (hparams.use_alibi) {
-                                    f = -std::abs(kv_self->cells_base.data[i].pos - pos);
-                                } else {
-                                    f = 0.0f;
-                                }
-                            }
-
-                            if (data) {
-                                data[h*(n_kv*n_tokens) + s*(n_kv*n_seq_tokens) + j*n_kv + i] = f;
-                            }
-                        }
-                    }
-                }
-
-                // mask padded tokens
-                if (data) {
-                    for (int i = n_tokens; i < GGML_PAD(n_tokens, GGML_KQ_MASK_PAD); ++i) {
-                        for (int j = 0; j < n_kv; ++j) {
-                            data[h*(n_kv*n_tokens) + i*n_kv + j] = -INFINITY;
-                        }
-                    }
-                }
-            }
-        }
-
-        {
-            float * data_swa = nullptr;
-
-            if (self_kq_mask_swa) {
-                GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask_swa->buffer));
-                data_swa = (float *) self_kq_mask_swa->data;
-            }
-
-            const int64_t n_kv = kv_self->cells_base.n;
-
-            for (int h = 0; h < 1; ++h) {
-                for (int s = 0; s < n_seqs; ++s) {
-                    const llama_seq_id seq_id = ubatch->seq_id[s][0];
-
-                    for (int j = 0; j < n_seq_tokens; ++j) {
-                        const llama_pos pos = ubatch->pos[s*n_seq_tokens + j];
-
-                        for (int i = 0; i < n_kv; ++i) {
-                            float f;
-                            // mask the token if:
-                            if (!kv_self->cells_base.data[i].has_seq_id(seq_id) // not the correct sequence
-                                    || (cparams.causal_attn && kv_self->cells_base.data[i].pos > pos) // for causal, mask future tokens
-                               ) {
-                                f = -INFINITY;
-                            } else {
-                                if (hparams.use_alibi) {
-                                    f = -std::abs(kv_self->cells_base.data[i].pos - pos);
-                                } else {
-                                    f = 0.0f;
-                                }
-                            }
-
-                            // may need to cut off old tokens for sliding window
-                            // TODO @ngxson : we are currently re-using the swa logic to store the chunked mask, we should rename SWA to something more generic like "aux mask"
-                            if (data_swa) {
-                                if (hparams.n_attn_chunk) {
-                                    llama_pos pos_chunk_start = (pos / hparams.n_attn_chunk) * hparams.n_attn_chunk;
-                                    if (kv_self->cells_base.data[i].pos < pos_chunk_start || pos < pos_chunk_start) {
-                                        f = -INFINITY;
-                                    }
-                                } else {
-                                    if (pos - kv_self->cells_base.data[i].pos >= (int32_t)hparams.n_swa) {
-                                        f = -INFINITY;
-                                    }
-                                }
-                                data_swa[h*(n_kv*n_tokens) + s*(n_kv*n_seq_tokens) + j*n_kv + i] = f;
-                            }
-                        }
-                    }
-                }
-
-                // mask padded tokens
-                if (data_swa) {
-                    for (int i = n_tokens; i < GGML_PAD(n_tokens, GGML_KQ_MASK_PAD); ++i) {
-                        for (int j = 0; j < n_kv; ++j) {
-                            data_swa[h*(n_kv*n_tokens) + i*n_kv + j] = -INFINITY;
-                        }
-                    }
-                }
-            }
-        }
+    if (self_kq_mask_swa) {
+        kv_self->set_input_kq_mask_swa(self_kq_mask_swa, ubatch, cparams.causal_attn);
     }
 }
 
@@ -1166,8 +1001,7 @@ ggml_tensor * llm_graph_context::build_inp_pos_bucket_dec() const {
 
     auto inp = std::make_unique<llm_graph_input_pos_bucket_kv>(hparams, kv_self);
 
-    // TODO: assert no SWA
-    const auto n_kv = kv_self->cells_base.n;
+    const auto n_kv = kv_self->n_base();
 
     auto & cur = inp->pos_bucket;
 
@@ -1373,7 +1207,7 @@ llm_graph_input_attn_kv_unified * llm_graph_context::build_attn_inp_kv_unified()
     auto inp = std::make_unique<llm_graph_input_attn_kv_unified>(hparams, cparams, kv_self);
 
     {
-        const auto n_kv = kv_self->cells_base.n;
+        const auto n_kv = kv_self->n_base();
 
         inp->self_kq_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
         //cb(inp->self_kq_mask, "KQ_mask", -1);
@@ -1385,7 +1219,7 @@ llm_graph_input_attn_kv_unified * llm_graph_context::build_attn_inp_kv_unified()
     if (hparams.n_swa_pattern > 1) {
         GGML_ASSERT(hparams.n_swa > 0);
 
-        const auto n_kv = kv_self->cells_base.n; // TODO: SWA
+        const auto n_kv = kv_self->n_swa();
 
         inp->self_kq_mask_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
         //cb(inp->self_kq_mask_swa, "KQ_mask_swa", -1);
@@ -1721,4 +1555,31 @@ void llm_graph_context::build_pooling(
     res->t_embd_pooled = cur;
 
     ggml_build_forward_expand(gf, cur);
+}
+
+int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional) {
+    // TODO move to hparams if a T5 variant appears that uses a different value
+    const int64_t max_distance = 128;
+
+    if (bidirectional) {
+        n_buckets >>= 1;
+    }
+
+    const int64_t max_exact = n_buckets >> 1;
+
+    int32_t relative_position = x - y;
+    int32_t relative_bucket = 0;
+
+    if (bidirectional) {
+        relative_bucket += (relative_position > 0) * n_buckets;
+        relative_position = abs(relative_position);
+    } else {
+        relative_position = -std::min<int32_t>(relative_position, 0);
+    }
+
+    int32_t relative_position_if_large = floorf(max_exact + logf(1.0 * relative_position / max_exact) * (n_buckets - max_exact) / log(1.0 * max_distance / max_exact));
+    relative_position_if_large = std::min<int32_t>(relative_position_if_large, n_buckets - 1);
+    relative_bucket += (relative_position < max_exact ? relative_position : relative_position_if_large);
+
+    return relative_bucket;
 }

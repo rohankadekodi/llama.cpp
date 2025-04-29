@@ -143,6 +143,8 @@ public:
     };
 
     struct kv_cells {
+        kv_cells(uint32_t size);
+
         void clear();
 
         bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1);
@@ -156,7 +158,7 @@ public:
         void restore();
         void commit();
 
-        bool find_slot(const llama_ubatch & batch);
+        bool find_slot(const llama_ubatch & batch, uint32_t padding);
 
         // find how many cells are currently in use
         uint32_t cell_max() const;
@@ -243,6 +245,14 @@ public:
 
     bool get_can_shift() const override;
 
+    uint32_t n_base() const;
+    uint32_t n_swa() const;
+
+    void set_input_kq_mask    (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask_swa(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_k_shift    (ggml_tensor * dst) const;
+    void set_input_pos_bucket (ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1) const override;
@@ -250,7 +260,14 @@ public:
 
     callbacks cbs;
 
-    kv_cells cells_base;
+    enum kv_cells_type {
+        KV_CELLS_TYPE_BASE = 0,
+        KV_CELLS_TYPE_SWA,
+        KV_CELLS_TYPE_COUNT,
+    };
+
+    //kv_cells cells_base;
+    std::array<std::unique_ptr<kv_cells>, KV_CELLS_TYPE_COUNT> cells_arr;
 
     std::vector<kv_layer> layers;
 
