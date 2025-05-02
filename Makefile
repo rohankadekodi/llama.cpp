@@ -171,7 +171,7 @@ endif
 
 # In GNU make default CXX is g++ instead of c++.  Let's fix that so that users
 # of non-gcc compilers don't have to provide g++ alias or wrapper.
-DEFCC  := cc
+DEFCC  := gcc
 DEFCXX := c++
 ifeq ($(origin CC),default)
 CC  := $(DEFCC)

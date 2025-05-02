@@ -8,6 +8,8 @@
 #include "sampling.h"
 #include "speculative.h"
 
+// #define CHUNKED_PREFILL
+
 // Change JSON_ASSERT from assert() to GGML_ASSERT:
 #define JSON_ASSERT GGML_ASSERT
 #include "json.hpp"
@@ -2903,8 +2905,34 @@ struct server_context {
         int32_t n_batch  = llama_n_batch(ctx);
         int32_t n_ubatch = llama_n_ubatch(ctx);
 
+        #ifdef CHUNKED_PREFILL
+        // there are currently slots with ongoing text generation
+        const bool is_tg = batch.n_tokens > 0;
+
+        // limit the batch to avoid blocking the processing
+        // if (is_tg) {
+        //     n_batch = 32; // TODO: configurable
+        // }
+        n_batch = 32;
+        #endif
+
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.n_tokens == 0) {
+            
+            #ifdef CHUNKED_PREFILL
+            // count how many slots are currently processing prompt
+            int n_slots_pp = 0;
+            for (auto & slot : slots) {
+                if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                    n_slots_pp++;
+                }
+            }
+
+            // determine the chunk size of the chunk prefill
+            // a slot cannot submit more than this number of tokens in a single batch if other slots are processing
+            const int32_t n_chunk_pp = std::max(n_slots_pp > 0 ? (n_batch / n_slots_pp) : n_batch, 8);
+            #endif
+
             for (auto & slot : slots) {
                 // check if we can batch this slot with the previous one
                 if (slot.is_processing()) {
@@ -3089,8 +3117,17 @@ struct server_context {
                     // remove the non-common part from the cache
                     slot.cache_tokens.resize(slot.n_past);
 
+                    #ifdef CHUNKED_PREFILL
+                    int n_cur = 0;
+                    #endif
+
                     // add prompt tokens for processing in the current batch
+                    #ifdef CHUNKED_PREFILL
+                    SLT_INF(slot, "slot.n_past = %d, n_prompt_tokens = %d, batch.n_tokens = %d, n_batch = %d, n_cur = %d, n_chunk_pp = %d\n", slot.n_past, slot.n_prompt_tokens, batch.n_tokens, n_batch, n_cur, n_chunk_pp);
+                    while (slot.n_past < slot.n_prompt_tokens && batch.n_tokens < n_batch && n_cur < n_chunk_pp) {
+                    #else
                     while (slot.n_past < slot.n_prompt_tokens && batch.n_tokens < n_batch) {
+                    #endif
                         // without pooling, we want to output the embeddings for all the tokens in the batch
                         const bool need_embd = slot.task_type == SERVER_TASK_TYPE_EMBEDDING && llama_pooling_type(slot.ctx) == LLAMA_POOLING_TYPE_NONE;
 
@@ -3102,6 +3139,10 @@ struct server_context {
 
                         slot.n_prompt_tokens_processed++;
                         slot.n_past++;
+
+                        #ifdef CHUNKED_PREFILL
+                        n_cur++;
+                        #endif
                     }
 
                     SLT_INF(slot, "prompt processing progress, n_past = %d, n_tokens = %d, progress = %f\n", slot.n_past, batch.n_tokens, (float) slot.n_prompt_tokens_processed / slot.n_prompt_tokens);
