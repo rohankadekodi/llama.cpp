@@ -9,6 +9,8 @@
 #include <cmath>
 #include <cstring>
 
+// AttentionWeightsRecorder g_attention_recorder;
+
 static int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional) {
     // TODO move to hparams if a T5 variant appears that uses a different value
     const int64_t max_distance = 128;
@@ -1165,7 +1167,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * kq_b,
          ggml_tensor * kq_mask,
              bool      v_trans,
-             float     kq_scale) const {
+             float     kq_scale,
+             int       il) const {
   //const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
   //const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
 
@@ -1198,6 +1201,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, n_embd_head_v*n_head, n_tokens);
     } else {
+        // printf("k shape: %d %d %d %d\n", k->ne[0], k->ne[1], k->ne[2], k->ne[3]);
+        // printf("q shape: %d %d %d %d\n", q->ne[0], q->ne[1], q->ne[2], q->ne[3]);
+
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
 
         // note: this op tends to require high floating point range
@@ -1226,6 +1232,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
+
+       // *** RECORD ATTENTION WEIGHTS HERE ***
+        // Assuming you have access to current layer index (il)
+        std::string layer_name = "layer_" + std::to_string(il) + "_attn";
+        g_attention_recorder.record_layer(il, kq, layer_name);
+
+        // print kq shape
+        // printf("kq shape: %d %d %d %d\n", kq->ne[0], kq->ne[1], kq->ne[2], kq->ne[3]);
+        // exit(0);
 
         if (!v_trans) {
             // note: avoid this branch
@@ -1292,7 +1307,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = ggml_permute(ctx0, v_cur, 0, 2, 1, 3);
     //cb(k, "v", il);
 
-    ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_b, kq_mask, false, kq_scale);
+    ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_b, kq_mask, false, kq_scale, il);
 
     cb(cur, "kqv_out", il);
 
@@ -1431,7 +1446,7 @@ ggml_tensor * llm_graph_context::build_attn(
                 ggml_element_size(kv_self->v_l[il])*n_ctx*n_embd_head_v,
                 0);
 
-    ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_b, kq_mask, v_trans, kq_scale);
+    ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_b, kq_mask, v_trans, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -1490,7 +1505,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = ggml_permute(ctx0, v_cur, 0, 2, 1, 3);
     //cb(k, "v", il);
 
-    ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_b, kq_mask, false, kq_scale);
+    ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_b, kq_mask, false, kq_scale, il);
 
     cb(cur, "kqv_out", il);
 

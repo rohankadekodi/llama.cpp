@@ -3,6 +3,7 @@
 #include "llama-arch.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
+#include "attention_recorder.h"
 
 #include <cstdint>
 #include <vector>
@@ -493,7 +494,8 @@ struct llm_graph_context {
              ggml_tensor * kq_b,
              ggml_tensor * kq_mask,
                     bool   v_trans,
-                   float   kq_scale) const;
+                   float   kq_scale,
+                   int     il) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

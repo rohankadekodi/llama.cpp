@@ -30,6 +30,8 @@ add_library(llama
             unicode-data.cpp
             unicode.cpp
             unicode.h
+            attention_recorder.cpp
+            attention_recorder.h
             )
 
 target_include_directories(llama PUBLIC . ../include ../common)

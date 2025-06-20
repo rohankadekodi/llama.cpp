@@ -5,6 +5,7 @@
 #include "llama-vocab.h"
 #include "llama-model-loader.h"
 #include "llama-model.h"
+#include "attention_recorder.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -19,6 +20,8 @@
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
+
+
 
 //
 // interface implementation

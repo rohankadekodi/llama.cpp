@@ -5,6 +5,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-kv-cache.h"
+#include "attention_recorder.h"
 
 #include <cassert>
 #include <cstring>
@@ -1351,14 +1352,24 @@ int llama_context::decode(llama_batch & inp_batch) {
 
         auto * gf = graph_init();
         auto res = graph_build(ctx_compute.get(), gf, ubatch, LLM_GRAPH_TYPE_DECODER);
+        const LayerAttentionWeights* layer_attention_weight = g_attention_recorder.get_layer(0);
+
 
         // LLAMA_LOG_INFO("graph build time: %.3f ms (%d nodes, %d leafs)\n", (ggml_time_us() - t_start_us)/1000.0, gf->n_nodes, gf->n_leafs);
 
         ggml_backend_sched_alloc_graph(sched.get(), gf);
+        layer_attention_weight = g_attention_recorder.get_layer(0);
 
         res->set_inputs(&ubatch);
+        layer_attention_weight = g_attention_recorder.get_layer(0);
 
         const auto compute_status = graph_compute(gf, ubatch.n_tokens > 1);
+        layer_attention_weight = g_attention_recorder.get_layer(0);
+        // if (layer_attention_weight->attention_tensor->ne[1] == 168) {
+        //     stop_attention_recording(true, "/mnt/tmpfs/llama.cpp/attention_analysis/temp/attention_weights");
+        //     exit(0);
+        // }
+        
         if (compute_status != GGML_STATUS_SUCCESS) {
             switch (compute_status) {
                 case GGML_STATUS_ABORTED:

@@ -7,6 +7,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "attention_recorder.h"
 
 // #define CHUNKED_PREFILL
 
@@ -32,10 +33,62 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+#include <iostream>
+#include <cstdlib>
+#include <nvtx3/nvToolsExt.h>  // For newer CUDA versions
+// For older CUDA versions you might need: #include <nvToolsExt.h>
+
+void startNvtxMonitoring() {
+    std::cout << "Pushing NVTX range 'Main'" << std::endl;
+    
+    try {
+        // Push the NVTX range named "Main"
+        nvtxRangePushA("Main");
+        std::cout << "NVTX push successful" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "NVTX push error: " << e.what() << std::endl;
+        std::exit(1);
+    } catch (...) {
+        std::cerr << "NVTX push unknown error" << std::endl;
+        std::exit(1);
+    }
+}
+
+// To end the range when you're done:
+void endNvtxMonitoring() {
+    std::cout << "Popping NVTX range" << std::endl;
+    
+    try {
+        nvtxRangePop();
+        std::cout << "NVTX pop successful" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "NVTX pop error: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "NVTX pop unknown error" << std::endl;
+    }
+}
+
+
+// Mark a specific instant event - equivalent to nvtx.mark() in Python
+void markNvtx(const char* message) {
+    std::cout << "Marking NVTX event: " << message << std::endl;
+    
+    try {
+        nvtxMarkA(message);
+        std::cout << "NVTX mark successful" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "NVTX mark error: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "NVTX mark unknown error" << std::endl;
+    }
+}
+
 
 enum stop_type {
     STOP_TYPE_NONE,
@@ -1009,6 +1062,7 @@ struct server_task_result_cmpl_partial : server_task_result {
     }
 };
 
+
 struct server_task_result_embd : server_task_result {
     int index = 0;
     std::vector<std::vector<float>> embedding;
@@ -1362,8 +1416,10 @@ struct server_slot {
 
     void release() {
         if (is_processing()) {
+            
             SLT_INF(*this, "stop processing: n_past = %d, truncated = %d\n", n_past, truncated);
-
+            markNvtx("Stop processing request");
+            
             t_last_used = ggml_time_us();
             t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
             state = SLOT_STATE_IDLE;
@@ -2956,8 +3012,10 @@ struct server_context {
                         slot.n_prompt_tokens = prompt_tokens.size();
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
-                        SLT_INF(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, n_prompt_tokens = %d\n", slot.n_ctx, slot.params.n_keep, slot.n_prompt_tokens);
+                        // start_attention_recording(false);
 
+                        SLT_INF(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, n_prompt_tokens = %d\n", slot.n_ctx, slot.params.n_keep, slot.n_prompt_tokens);
+                        markNvtx("Start processing request");
                         // print prompt tokens (for debugging)
                         if (1) {
                             // first 16 tokens (avoid flooding logs)
@@ -3166,7 +3224,13 @@ struct server_context {
                         slot.n_decoded = 0;
                         slot.i_batch   = batch.n_tokens - 1;
 
+                        markNvtx("Done processing prompt");
                         SLT_INF(slot, "prompt done, n_past = %d, n_tokens = %d\n", slot.n_past, batch.n_tokens);
+                        // stop_attention_recording(false, "attention_weights");
+                        // std::vector<LayerAttentionWeights> all_layers = g_attention_recorder.get_all_layers();
+                        // for (const auto& layer : all_layers) {
+                        //     std::cout << "Layer " << layer.layer_id << " has " << layer.n_tokens << " tokens" << std::endl;
+                        // }
                     }
                 }
 
@@ -3204,8 +3268,17 @@ struct server_context {
                 batch.logits   + i,
             };
 
+            start_attention_recording(false);
+
             const int ret = llama_decode(ctx, batch_view);
             metrics.on_decoded(slots);
+
+            stop_attention_recording(true, "/mnt/tmpfs/llama.cpp/attention_analysis/temp/attention_weights");
+            std::vector<LayerAttentionWeights> all_layers = g_attention_recorder.get_all_layers();
+            for (const auto& layer : all_layers) {
+                std::cout << "Layer " << layer.layer_id << " has " << layer.n_tokens << " tokens" << std::endl;
+            }
+            exit(0);
 
             if (ret != 0) {
                 if (n_batch == 1 || ret < 0) {
@@ -3426,6 +3499,7 @@ inline void signal_handler(int signal) {
 
     shutdown_handler(signal);
 }
+
 
 int main(int argc, char ** argv) {
     // own arguments required by this example
@@ -4536,6 +4610,8 @@ int main(int argc, char ** argv) {
     ctx_server.init();
     state.store(SERVER_STATE_READY);
 
+    startNvtxMonitoring();
+
     LOG_INF("%s: model loaded\n", __func__);
 
     // print sample chat example to make it clear which template is used
@@ -4577,6 +4653,8 @@ int main(int argc, char ** argv) {
 
     clean_up();
     // t.join(); // FIXME: http thread may stuck if there is an on-going request. we don't need to care about this for now as the HTTP connection will already be closed at this point, but it's better to fix this
+
+    endNvtxMonitoring();
 
     return 0;
 }
